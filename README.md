@@ -1,5 +1,6 @@
 # PPT text detector keras
 This is a standalone repository containing a keras based text detector for English/Arabic power point images. 
+
    *Author: Yue Wu 
    *Email: yue_wu@isi.edu
 
