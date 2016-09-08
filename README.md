@@ -13,3 +13,4 @@ Python Dependencies:
     - theano
     - keras v1.0.3
     - scipy, numpy, cv2
+    
