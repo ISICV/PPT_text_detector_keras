@@ -1,0 +1,401 @@
+#/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Sep  6 13:17:14 2016
+@author: yue_wu
+
+decoding script for PPT keras text detector
+
+keras.version = 1.0.7
+training images are of shape ( 540, 720, 3 )
+training images are of fontsize 14 to 40
+"""
+import os
+import cv2
+import numpy as np
+from keras import backend as K
+from datetime import datetime
+from skimage.measure import label
+from theano import tensor
+from sklearn.externals.joblib import Parallel, delayed
+from keras.models import Sequential
+from keras.layers.core import Dense, Dropout, Activation, Permute, Reshape
+from keras.layers import Convolution2D, MaxPooling2D, Dense, Dropout, Activation, Flatten, ZeroPadding2D, UpSampling2D
+from keras.optimizers import SGD
+
+#--------------------------------------------------------------------------------
+# Create CNN model
+#--------------------------------------------------------------------------------
+input_shape = ( 256, 336 ) # input shape of CNN
+def softmax4(x):
+    """Custom softmax activation function for a 4D input tensor
+    softmax along axis = 1
+    """
+    ndim = K.ndim(x)
+    if ndim == 2:
+        return K.softmax(x)
+    elif ndim == 3:
+        e = K.exp(x - K.max(x, axis=-1, keepdims=True))
+        s = K.sum(e, axis=-1, keepdims=True)
+        return e / s
+    elif ndim == 4:
+        e = K.exp(x - K.max(x, axis=1, keepdims=True))
+        s = K.sum(e, axis=1, keepdims=True)
+        return e / s
+    else:
+        raise Exception('Cannot apply softmax to a tensor that is not 2D or 3D. ' +
+                        'Here, ndim=' + str(ndim))
+
+def cross_entropy( true_dist, coding_dist ) :
+    return -tensor.sum(true_dist * tensor.log(coding_dist), axis=1 )
+
+
+def create_model( model_filepath = None ) :
+    # Define CNN model
+    model = Sequential()
+    # block 1
+    model.add( ZeroPadding2D( padding = ( 3, 3 ), input_shape = ( 3, input_shape[0], input_shape[1] ) ) )
+    model.add( Convolution2D( 16, 7, 7, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( Convolution2D( 32, 1, 1, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( ZeroPadding2D( padding = ( 2, 2 ) ) )
+    model.add( Convolution2D( 48, 5, 5, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( Convolution2D( 64, 1, 1, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( MaxPooling2D( pool_size=( 2, 2 ) ) )
+    # block 2
+    model.add( ZeroPadding2D( padding = ( 1, 1 ) ) )
+    model.add( Convolution2D( 80, 3, 3, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( Convolution2D( 96, 1, 1, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( ZeroPadding2D( padding = ( 1, 1 ) ) )
+    model.add( Convolution2D( 112, 3, 3, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( Convolution2D( 128, 1, 1, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( MaxPooling2D( pool_size=( 2, 2 ) ) )
+    # block 3
+    model.add( ZeroPadding2D( padding = ( 1, 1 ) ) )
+    model.add( Convolution2D( 144, 3, 3, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( Convolution2D( 160, 1, 1, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( ZeroPadding2D( padding = ( 1, 1 ) ) )
+    model.add( Convolution2D( 176, 3, 3, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( Convolution2D( 192, 1, 1, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( MaxPooling2D( pool_size=( 2, 2 ) ) )
+    # block 4
+    model.add( ZeroPadding2D( padding = ( 1, 1 ) ) )
+    model.add( Convolution2D( 224, 3, 3, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( ZeroPadding2D( padding = ( 0, 1 ) ) )
+    model.add( Convolution2D( 256, 1, 3, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( Convolution2D( 3, 1, 1, border_mode='valid' ) )
+    model.add( Activation( 'relu' ) )
+    # block 5
+    model.add( UpSampling2D( ( 2, 2 ) ) )
+    model.add( ZeroPadding2D( padding = ( 1, 1 ) ) )
+    model.add( Convolution2D( 16, 3, 3, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( UpSampling2D( ( 2, 2 ) ) )
+    model.add( ZeroPadding2D( padding = ( 3, 3 ) ) )
+    model.add( Convolution2D( 8, 7, 7, border_mode='valid' ) )
+    model.add( Activation('relu') )
+    model.add( UpSampling2D( ( 2, 2 ) ) )
+    model.add( ZeroPadding2D( padding = ( 5, 5 ) ) )
+    model.add( Convolution2D( 3, 11, 11, border_mode='valid' ) )
+    model.add( Activation( softmax4 ) )
+    model.compile('adam', cross_entropy )
+    # load weights
+    if ( model_filepath is not None ) :
+        model.load_weights( model_filepath )
+    return model
+
+def get_patch_bboxes( data_shape, patch_shape, subsample = 32 ) :
+    """get patch bboxes from a given image array
+    INPUT:
+        data_tensor = tuple, ( n_samples, n_chs, height, width )
+        patch_shape = tuple, ( patch_height, patch_width )
+        sub_sample = int, move next patch by $sub_sample pixels along x and y, respectively
+    OUTPUT:
+        patch_bboxes = list, each element is a patch_bbox whose format is ( top, bot, left, right )
+    """
+    assert len( data_shape ) == 4, "ERROR: expect data_tensor of shape ( n_samples, n_chs, height, width )"
+    n_samples, n_chs, height, width = data_shape
+    box_height, box_width = patch_shape
+    assert ( box_height <= height ) and ( box_width <= width ), "ERROR: patch_shape %dx%d cannot be smaller than data_tensor %dx%d" % ( box_height, box_width, height, width )
+    x_list = range( 0, width  - box_width,  subsample ) + [ width  - box_width ]
+    y_list = range( 0, height - box_height, subsample ) + [ height - box_height ]
+    patch_bboxes = []
+    for x in x_list :
+        left, right = x, x + box_width
+        for y in y_list :
+            top, bot = y, y + box_height
+            patch_bboxes.append( [ top, bot, left, right ] )
+    return patch_bboxes
+
+def sliding_window_decoding( model, X, input_shape, overlapping = 32 ) :
+    """decoding for each sliding window
+    """
+    patch_bboxes = get_patch_bboxes( X.shape, input_shape, overlapping )
+    n_samples, n_chs, height, width = X.shape
+    Z = np.zeros( X.shape, dtype = np.float32 )
+    C = np.zeros( X.shape, dtype = np.float32 )
+    pad_before, pad_after = min( input_shape ) // 4, min( input_shape ) // 4
+    for top, bot, left, right in patch_bboxes :
+        x = X[ :, :, top:bot, left:right ]
+        z = model.predict( x )
+        if ( top == 0 ) and ( bot == height ) :
+            if ( left == 0 ) and ( right == width ):
+                Z[:,:,top:bot,left:right] += z
+                C[:,:,top:bot,left:right] += 1.       
+            elif ( left == 0 ) :
+                Z[:,:,top:bot,left:right-pad_after] += z[:,:,:,:-pad_after]
+                C[:,:,top:bot,left:right-pad_after] += 1.
+            elif ( right == width ) :
+                Z[:,:,top:bot,left+pad_before:right] += z[:,:,:,pad_before:]
+                C[:,:,top:bot,left+pad_before:right] += 1.
+            else :
+                Z[:,:,top:bot,left+pad_before:right-pad_after] += z[:,:,:,pad_before:-pad_after]
+                C[:,:,top:bot,left+pad_before:right-pad_after] += 1.            
+        elif  ( top == 0 ) :
+            if ( left == 0 ) and ( right == width ):
+                Z[:,:,top:bot-pad_after,left:right] += z[:,:,:-pad_after,:]
+                C[:,:,top:bot-pad_after,left:right] += 1.
+            elif ( left == 0 ) :
+                Z[:,:,top:bot-pad_after,left:right-pad_after] += z[:,:,:-pad_after,:-pad_after]
+                C[:,:,top:bot-pad_after,left:right-pad_after] += 1.                
+            elif ( right == width ) :
+                Z[:,:,top:bot-pad_after,left+pad_before:right] += z[:,:,:-pad_after,pad_before:]
+                C[:,:,top:bot-pad_after,left+pad_before:right] += 1.
+            else :
+                Z[:,:,top:bot-pad_after,left+pad_before:right-pad_after] += z[:,:,:-pad_after,pad_before:-pad_after]
+                C[:,:,top:bot-pad_after,left+pad_before:right-pad_after] += 1.
+        elif ( bot == height ) :
+            if ( left == 0 ) and ( right == width ):
+                Z[:,:,top+pad_before:bot,left:right] += z[:,:,pad_before:,:]
+                C[:,:,top+pad_before:bot,left:right] += 1.
+            elif ( left == 0 ) :
+                Z[:,:,top+pad_before:bot,left:right-pad_after] += z[:,:,pad_before:,:-pad_after]
+                C[:,:,top+pad_before:bot,left:right-pad_after] += 1.
+            elif ( right == width ) :
+                Z[:,:,top+pad_before:bot,left+pad_before:right] += z[:,:,pad_before:,pad_before:]
+                C[:,:,top+pad_before:bot,left+pad_before:right] += 1.
+            else :
+                Z[:,:,top+pad_before:bot,left+pad_before:right-pad_after] += z[:,:,pad_before:,pad_before:-pad_after]
+                C[:,:,top+pad_before:bot,left+pad_before:right-pad_after] += 1.
+        else :
+            if ( left == 0 ) and ( right == width ) :
+                Z[:,:,top+pad_before:bot-pad_after,left:right] += z[:,:,pad_before:-pad_after,:]
+                C[:,:,top+pad_before:bot-pad_after,left:right] += 1.
+            elif ( left == 0 ) :
+                Z[:,:,top+pad_before:bot-pad_after,left:right-pad_after] += z[:,:,pad_before:-pad_after,:-pad_after]
+                C[:,:,top+pad_before:bot-pad_after,left:right-pad_after] += 1.                
+            elif ( right == width ) :
+                Z[:,:,top+pad_before:bot-pad_after,left+pad_before:right] += z[:,:,pad_before:-pad_after,pad_before:]
+                C[:,:,top+pad_before:bot-pad_after,left+pad_before:right] += 1.
+            else :
+                Z[:,:,top+pad_before:bot-pad_after,left+pad_before:right-pad_after] += z[:,:,pad_before:-pad_after,pad_before:-pad_after]
+                C[:,:,top+pad_before:bot-pad_after,left+pad_before:right-pad_after] += 1.
+    return Z / C
+
+def prediction( model, image_file, relax_along_y = 0, pad_along_x = 0, proba_thresh = 0.25, height_thresh = 6, width_thresh = 6, force_no_resize = False ) :
+    img = cv2.imread( image_file, -1 )
+    height, width = img.shape[:2]
+    if ( img.ndim == 2 ) :
+        img = np.dstack( [ img, img, img ] )
+    # resize image
+    aspect_ratio = float( height ) / width
+    if ( force_no_resize ) :
+        new_height, new_width = input_shape
+    else :
+        if ( aspect_ratio < 256./336 ) :
+            new_height = input_shape[0]
+            new_width  = int( new_height / aspect_ratio )
+            img = cv2.resize( img, ( new_width, new_height ) )
+        else :
+            new_width  = input_shape[1]
+            new_height = int( new_width * aspect_ratio )
+            img = cv2.resize( img, ( new_width, new_height ) )
+    # decode
+    X = np.expand_dims( np.rollaxis( img, 2, 0 ), 0 ).astype( np.float32 ) / 255. - 0.5
+    # adapt to input size
+    slide = min( input_shape ) // 8
+    hyp = sliding_window_decoding( model, X, input_shape, slide )
+    # resize back to original size
+    hyp = np.array( np.rollaxis( hyp[0], 0, 3 ) * 255 ).astype( 'uint8' )
+    hyp = cv2.resize( hyp, ( width, height ) )
+    # parse results
+    labels = hyp.argmax( axis = 2 )
+    text = labels == 2
+    bw, nb_regs = label( text, return_num = True )
+    output_lines = []
+    for reg_id in range( 1, nb_regs + 1 ) :
+        row_idx, col_idx = np.nonzero( bw == reg_id )
+        # relaxing along x
+        left, right = col_idx.min(), col_idx.max() + 1
+        left  = max( 0, left - pad_along_x )
+        right = min( width, right + pad_along_x )
+        # relaxing along y
+        top, bot = row_idx.min(), row_idx.max() + 1
+        pad_along_y = int( ( bot - top ) * relax_along_y )
+        top = max( 0, top - pad_along_y )
+        bot = min( height, bot + pad_along_y )
+        # estimate text proba
+        proba = np.median( hyp[top:bot, left:right, 2 ] ) / 255.
+        if ( proba > proba_thresh ) and ( bot - top > height_thresh ) and ( right - left > width_thresh ) :
+            output_lines.append( [ top, bot, left, right, proba ] )
+    return output_lines, hyp
+
+
+def debug( img, bboxes, color = ( 255, 0, 0 ) ) :
+    debug = np.array( img ).astype('uint8')
+    height, width = debug.shape[:2]
+    for top, bot, left, right, proba in bboxes :
+        for ch in range(3) :
+            for y in range( max( 0, top ), min( height, bot ) ) :
+                debug[ y, max( 0,left-1):min(left+1,width), ch ]   = color[ ch ]
+                debug[ y, max( 0,right-1):min(right+1,width), ch ] = color[ ch ]
+            for x in range( max( 0, left ), min( width, right ) ) :
+                debug[ max(0,top-1):min(height,top+1), x, ch ] = color[ ch ]
+                debug[ max(0,bot-1):min(height,bot+1), x, ch ] = color[ ch ]
+    return debug
+
+
+def ppt_text_decoder( model, image_files, visualization_dir = None, pad_y = 5, pad_x = 5, verbose = False, force_no_resize = False,
+                      proba_thresh = .25, height_thresh = 6, width_thresh = 6 ) :
+    output_lines = [ " ".join( [ 'image_file', 'box_top', 'box_bot', 'box_left', 'box_right', 'box_proba' ] ) ]
+    failed_list = []
+    for image_file in image_files :
+        if ( verbose ) :
+            print "-" * 100
+            print "INFO: work on image_file", image_file
+        try :
+            bname = os.path.basename( image_file )
+            img = cv2.imread( image_file, -1 )
+            if ( img.ndim == 2 ) :
+                img = np.dstack( [ img, img, img ] )
+            bbox, hyp = prediction( model, image_file, relax_along_y = 0, pad_along_x = 0, proba_thresh = proba_thresh, height_thresh = height_thresh, width_thresh = width_thresh, force_no_resize = force_no_resize )
+            bbox = [ [ top - pad_y, bot + pad_y, left - pad_x, right + pad_x, proba ]for top, bot, left, right, proba in bbox ]
+            if ( visualization_dir is not None ) :
+                vis = debug( img, bbox )
+                relax_bbox = [ [ top + 2, bot - 2, left + 2, right - 2, proba ] for top, bot, left, right, proba in bbox ]
+                vis = debug( vis, relax_bbox, ( 0, 255, 0 ) )
+                relax_bbox = [ [ top + 4, bot - 4, left + 4, right - 4, proba ] for top, bot, left, right, proba in bbox ]
+                vis = debug( vis, relax_bbox, ( 0, 0, 255 ) )
+                # save to distk
+                cv2.imwrite( os.path.join( visualization_dir, 'proba-' + bname ), hyp )
+                cv2.imwrite( os.path.join( visualization_dir, 'vis-' + bname ), vis )
+                print "INFO: save visualization results to", os.path.join( visualization_dir, 'vis-' + bname )
+        except Exception, e :
+            print "WARNING: something wrong with", image_file, e
+            failed_list.append( ( image_file, e ) )
+            continue
+        # save detection results to bbox
+        output_lines += [ " ".join( [ image_file, str(top), str(bot), str(left), str(right), str(proba) ] ) for top, bot, left, right, proba in bbox ]
+    return output_lines, failed_list
+
+#--------------------------------------------------------------------------------
+# Decoding
+#--------------------------------------------------------------------------------
+import sys
+import argparse
+if __name__ == '__main__' :
+    """PPT text detection using Keras DeconvNet
+    Usage:
+        ppt_keras_decoder.py -h
+    """
+    this_file_path = os.path.realpath( __file__ )
+    this_file_dir  = os.path.dirname( this_file_path )
+    default_weights = os.path.join( this_file_dir, 'model', 'categorical_updateline.hd5' )
+    parser = argparse.ArgumentParser( description = 'Keras PPT (Arabic/English) Text Detector' )
+    parser.add_argument( '-f',  action = "append", dest = "input_files", default = [], help = "input test image file path" )
+    parser.add_argument( '-l',  action = "store", dest = "input_flist", default = None, help = "input test image file list, each line is a file" )
+    parser.add_argument( '-w',  action = "store", dest = "weights", default = default_weights, help = "Keras model weights" )
+    parser.add_argument( '-px', action = "store", dest = "pad_x", default = 0, help = "pad nb_pixels along x axis for a bbox", type = int )
+    parser.add_argument( '-py', action = "store", dest = "pad_y", default = 5, help = "pad nb_pixels along y axis for a bbox", type = int )
+    parser.add_argument( '-o',  action = "store", dest = "output_bbox_file", default = None, help = "output detected bbox file" )
+    parser.add_argument( '-d',  action = "store", dest = "visualization_dir", default = None,help = "output visualization dir for debugging")
+    parser.add_argument( '-tp', action = "store", dest = "proba_thresh", default = 0.25, help = "threshold for text region probability", type =float )
+    parser.add_argument( '-tw', action = "store", dest = "width_thresh", default = 6, help = "threshold for text region width", type = int )
+    parser.add_argument( '-th', action = "store", dest = "height_thresh", default = 3, help = "threshold for text region height", type = int )
+    parser.add_argument( '-no_resize', action = "store_true", dest = "no_resize", default = False, help = "decoding without resize" )
+    parser.add_argument( '-verbose', action = "store_true", dest = "verbose", default = False, help = "verbose decoding" )
+    parser.add_argument( '--mode', choices = ( "ppt", "word", "pdf" ), dest = "mode", default = "ppt", help = "decoder working mode with preset params" )
+    parser.add_argument( '--version', action='version', version='%(prog)s 1.0' )
+    # parse program arguments
+    res = parser.parse_args()
+    input_file = res.input_files
+    input_flist = res.input_flist
+    input_weights = res.weights
+    pad_x = res.pad_x
+    pad_y = res.pad_y
+    verbose = res.verbose
+    no_resize = res.no_resize
+    proba_thresh = res.proba_thresh
+    width_thresh = res.width_thresh
+    height_thresh = res.height_thresh
+    output_bbox_file = res.output_bbox_file
+    visualization_dir = res.visualization_dir
+    mode = res.mode
+    if ( mode in [ "word", "pdf" ] ) :
+        no_resize = True        
+    # verbose print if necessary
+    if ( verbose ) :
+        print "INFO: keras PPT text detector decoding using"
+        print "-" * 100
+        print "    input_file =", input_file
+        print "    input_flist =", input_flist
+        print "    output_bbox_file =", output_bbox_file
+        print "    visualization_dir =", visualization_dir
+        print "    working_mode =", mode
+        print "." * 100
+        print "    ( pad_x, pad_y ) =", ( pad_x, pad_y ) 
+        print "    ( proba_thresh, height_thresh, width_thresh ) =", ( proba_thresh, height_thresh, width_thresh )
+        print "    weights =", input_weights
+        print "    decoding_without_resize =", no_resize
+        print "-" * 100
+    # unify text detection inputs
+    if ( input_flist is not None ) :
+        assert os.path.isfile( input_flist ), "ERROR: cannot locate input image file list %s" % input_flist
+        with open( input_flist, 'r' ) as IN :
+            image_files = [ line.strip() for line in IN.readlines() ]
+    elif ( len( input_files ) > 0 ):
+        image_files = input_files
+    else :
+        print "ERROR: no input file or input file list is given, exit"
+        exit(-1)
+    if ( visualization_dir is not None ) :
+        if ( not os.path.isdir( visualization_dir ) ) :
+            os.system( 'mkdir -p %s' % visualization_dir )
+        assert os.path.isdir( visualization_dir ), "ERROR: cannot locate/create output visualization directory %s" % visualization_dir
+    assert os.path.isfile( input_weights ), "ERROR: cannot locate keras weight file %s" % input_weights
+    print "INFO: successfully load", len( image_files ), "images"
+    # text detection
+    model = create_model( input_weights )
+    output_lines, failed_list = ppt_text_decoder( model, image_files, visualization_dir = visualization_dir, pad_y = pad_y, pad_x = pad_x, verbose = verbose, \
+                                     proba_thresh = proba_thresh, width_thresh = width_thresh, height_thresh = height_thresh, force_no_resize = no_resize )
+    # generate output
+    if ( output_bbox_file is not None ) :
+        with open( output_bbox_file, 'w' ) as OUT :
+            OUT.write( "\n".join( output_lines ) + "\n" )
+        if ( verbose ) :
+            print "-" * 100
+            print "INFO: save detected text bboxes to", output_bbox_file
+    else :
+        print "\n".join( output_lines )
+    # print out failed list
+    if ( len( failed_list ) > 0 ) :
+        print "-" * 100
+        print "WARNING: failed files are listed below"
+        for image_file, e in failed_list :
+            print "   ", image_file, e
+
+
+
