@@ -1,8 +1,16 @@
 # PPT text detector keras
-This is a standalone repository containing a keras based text detector for English/Arabic power point images. 
+This is a standalone repository containing a keras based text detector for English/Arabic power point images with border supports. 
 
    * Author: Yue Wu 
    * Email: yue_wu@isi.edu
+
+For example, given an input image below
+![input](https://github.com/ISICV/PPT_text_detector_keras/blob/master/dataset/ppt/img7494.jpg?raw=true)
+this decoder will give you output
+![output](https://github.com/ISICV/PPT_text_detector_keras/blob/master/test/demo_ppt_output/vis-img7494.jpg?raw=true)
+where additional debug image visualizing the probability of non-text, border, and text are shown below
+![proba](https://github.com/ISICV/PPT_text_detector_keras/blob/master/test/demo_ppt_output/proba-img7494.jpg?raw=true)
+
 
 ## This repository contains the following modules :
     * dataset: testing data for sanity check and demo purposes
@@ -46,3 +54,4 @@ This is a standalone repository containing a keras based text detector for Engli
                            decoder working mode with preset params
      --version             show program's version number and exit
 ```
+
